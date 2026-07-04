@@ -1,0 +1,285 @@
+.TH BITROT-MD5 1 "2026" "bitrot-md5" "User Commands"
+.SH NAME
+bitrot-md5 \- detect bit rot using md5sum\-compatible checksum files
+.SH SYNOPSIS
+.B bitrot-md5
+.RB [ \-p\ [ N ]]
+.RB [ \-r
+.IR DIR ]
+.RB [ \-s ]
+.RB [ \-u
+.RI [ FILE ]]
+.RB [ \-v ]
+.RB [ \-h ]
+.RI [ CHECKSUM_FILE ]
+.SH DESCRIPTION
+.B bitrot-md5
+computes the MD5 hash of every regular file in a directory tree and
+compares it against a saved checksum file.
+When a hash does not match, the tool distinguishes between two causes:
+.TP
+.I Bit rot
+The file content changed but its modification time is older than or
+equal to the checksum file timestamp.
+This indicates silent corruption.
+.TP
+.I Modification
+The file content changed and its modification time is newer than the
+checksum file timestamp.
+This indicates an intentional edit.
+.PP
+The checksum file uses standard
+.BR md5sum (1)
+format and can be verified manually with
+.BR "md5sum \-c" .
+By default, if nothing is changed or wrong, nothing is printed and the
+program exits with status 0.
+When changes are detected but no
+.B \-\-update
+file is specified, the updated checksums are written to a temporary
+file in
+.B $TMPDIR
+(or
+.I /tmp
+if unset) and the path is printed, so the user can review and
+.BR mv (1)
+it into place.
+.SH OPTIONS
+.TP
+.BR \-p " \fR[\fP" N "\fR]\fP, " \-\-parallel " \fR[\fP" N "\fR]\fP"
+Enable parallel hashing with
+.I N
+worker goroutines.
+If
+.I N
+is omitted, defaults to the number of available CPUs.
+Default: sequential (single thread).
+Recommended for SSDs, NVMe drives, and network mounts.
+Not recommended for spinning disks, where concurrent reads cause seek
+thrashing.
+.TP
+.BR \-r " \fIdir\fP, " \-\-\-root " \fIdir\fP"
+Directory to scan.
+Default: current directory, or the parent directory of the checksum
+file if one is specified on the command line.
+.TP
+.BR \-s ", " \-\-summary
+Show scan preamble (last scan time and entry count) and summary even
+when all files are OK.
+.TP
+.BR \-u " \fR[\fP" file "\fR]\fP, " \-\-update " \fR[\fP" file "\fR]\fP"
+Write updated checksums to
+.IR file .
+If
+.I file
+is omitted (bare
+.B \-u
+or
+.BR \-\-update ),
+defaults to
+.RI DIRNAME .md5
+where
+.I DIRNAME
+is the basename of the current working directory.
+.TP
+.BR \-v ", " \-\-verbose
+Show per\-file verification status.
+Implies
+.BR \-\-summary .
+.TP
+.BR \-h ", " \-\-help
+Display usage information and exit.
+.SH CHECKSUM_FILE
+The positional argument specifies the checksum file to read.
+If omitted:
+.TP
+.B 1.
+If
+.B \-\-update
+is given, the checksum file defaults to
+.I /dev/null
+(first run).
+.TP
+.B 2.
+Otherwise, the checksum file defaults to
+.RI DIRNAME .md5
+in the current directory, where
+.I DIRNAME
+is the basename of the current working directory.
+.PP
+If the positional argument is a directory rather than a file, the
+checksum file is derived as
+.RI DIRNAME / DIRNAME .md5
+and the directory is used as the scan root.
+.SH DEFAULTS
+When run with no arguments from
+.IR /path/to/mydata/ :
+.IP \(bu 2
+Scans the current directory.
+.IP \(bu 2
+Reads
+.IR ./mydata.md5 .
+.IP \(bu 2
+Writes only to a temporary file unless
+.B \-\-update
+is given.
+.IP \(bu 2
+Prints nothing if all files are unchanged.
+.SH EXAMPLES
+First run, indexing all files in the current directory:
+.PP
+.RS 4
+.nf
+$ bitrot-md5 -u
+.fi
+.RE
+.PP
+Check for corruption (silent if all OK):
+.PP
+.RS 4
+.nf
+$ bitrot-md5
+.fi
+.RE
+.PP
+Check without \-u, review the temp file, then apply:
+.PP
+.RS 4
+.nf
+$ bitrot-md5
+MODIFIED (1):
+  ./docs/report.pdf
+    saved:  9c3a2b1e...
+    actual: 5f8d1c7a...
+
+Checksums saved to /tmp/bitrot-md5-1234567890.md5
+  Verify and apply: mv /tmp/bitrot-md5-1234567890.md5 CHECKSUM_FILE
+$ cat /tmp/bitrot-md5-1234567890.md5
+$ mv /tmp/bitrot-md5-1234567890.md5 /data/backup.md5
+.fi
+.RE
+.PP
+Verbose scan:
+.PP
+.RS 4
+.nf
+$ bitrot-md5 -v
+Last scan : 2026-06-25 14:30:00
+Entries   : 1024
+
+./photos/img001.jpg: OK
+./photos/img002.jpg: BAD
+./docs/report.pdf: MOD
+
+BIT ROT DETECTED (1):
+  ./photos/img002.jpg
+    saved:  a3f2b8c1...
+    actual: 7e1d9f44...
+
+Wrote 1024 entries to /data/.bitrot.md5
+.fi
+.RE
+.PP
+Scan a specific directory with parallel hashing:
+.PP
+.RS 4
+.nf
+$ bitrot-md5 -p4 -u /mnt/backup/backup.md5 /mnt/backup
+.fi
+.RE
+.PP
+Check and update in place:
+.PP
+.RS 4
+.nf
+$ bitrot-md5 -u .bitrot.md5 .bitrot.md5
+.fi
+.RE
+.PP
+Verify manually with standard tools:
+.PP
+.RS 4
+.nf
+$ cd /mnt/backup && md5sum -c backup.md5
+.fi
+.RE
+.SH VERBOSITY
+With
+.BR \-v / \-\-verbose ,
+each file is printed on its own line with a status tag:
+.TP
+.B OK
+Hash matches the saved value.
+.TP
+.B BAD
+Hash changed, mtime older than checksum file.
+Indicates bit rot.
+.TP
+.B MOD
+Hash changed, mtime newer than checksum file.
+Indicates intentional modification.
+.TP
+.B NEW
+File not present in the previous checksum file.
+.TP
+.B DELETED
+File was in the previous checksum file but no longer exists.
+.TP
+.B ERROR
+File could not be read.
+.SH FILE_FORMAT
+Standard
+.BR md5sum (1)
+output format: each line contains a 32\-character MD5 hex digest,
+two spaces, and the relative file path with a
+.B ./
+prefix.
+.SH EXCLUSIONS
+.TP
+\(bu
+Regular files only: symlinks, device files, FIFOs, and sockets are
+skipped.
+.TP
+\(bu
+Hidden directories (names starting with
+.BR . )
+are skipped.
+.TP
+\(bu
+The checksum input and output files themselves are excluded from scanning.
+.SH EXIT STATUS
+.TP
+.B 0
+No bit rot detected.
+.TP
+.B 1
+Bit rot detected (silent corruption).
+.TP
+.B 2
+Usage error.
+.SH ENVIRONMENT
+.TP
+.B GOMAXPROCS
+Influences the default number of parallel workers when
+.B \-\-parallel
+is used without an explicit count.
+.SH NOTES
+MD5 is sufficient for bit rot detection.
+A random bit flip has a 2^128 chance of producing the same
+digest \(em one undetected error per ~10^38 bits.
+The known collision attacks against MD5 require crafted inputs and are
+irrelevant for detecting accidental corruption.
+.PP
+No per\-file timestamps are stored.
+The checksum file's modification time serves as the single "last known
+good" timestamp.
+.SH SEE ALSO
+.BR md5sum (1),
+.BR find (1)
+.SH AUTHORS
+Durval Menezes (jmbitrot-md5@durval.com)  with assistance from Xiaomi MiMo (MiMo\-V2.5Pro),
+see:
+.I https://aistudio.xiaomimimo.com/#/share/58b8083baac51c664bfb742e627ffeb3
+for the entire design/code/debug/finish process.
+.SH LICENSE
+WTFPL \(em Do What The F*** You Want To Public License.

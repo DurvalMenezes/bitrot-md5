@@ -1,0 +1,10 @@
+bitrot-md5
+bitrot-md5.exe
+*.md5
+!testdata/**/*.md5
+*.test
+*.out
+*.swp
+*.bak
+.RCS/
+.golangci.bck.yml
