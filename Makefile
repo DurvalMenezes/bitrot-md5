@@ -9,9 +9,6 @@ build:
 test:
 	go test -v
 
-lint:
-	golangci-lint run
-
 install: build
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 $(BINARY) $(DESTDIR)$(PREFIX)/bin/$(BINARY)
@@ -23,4 +20,7 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/$(BINARY).1.gz
 
 clean:
-	rm -f $(BINARY) *.md5
+	rm -f $(BINARY)
+
+lint:
+	golangci-lint run

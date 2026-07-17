@@ -3,7 +3,9 @@
 bitrot-md5 \- detect bit rot using md5sum\-compatible checksum files
 .SH SYNOPSIS
 .B bitrot-md5
+.RB [ \-m\ \fIduration\fR ]
 .RB [ \-p\ [ N ]]
+.RB [ \-R ]
 .RB [ \-r
 .IR DIR ]
 .RB [ \-s ]
@@ -46,6 +48,16 @@ if unset) and the path is printed, so the user can review and
 it into place.
 .SH OPTIONS
 .TP
+.BR \-m " \fIduration\fP, " \-\-max-time " \fIduration\fP"
+Set a time budget for verify mode (e.g.
+.BR 30m ,
+.BR 1h ,
+.BR 45s ).
+If the budget is exceeded before all files are checked, the run is
+reported as partial.
+This option applies only to verify mode and is ignored by
+.BR \-u / \-\-update .
+.TP
 .BR \-p " \fR[\fP" N "\fR]\fP, " \-\-parallel " \fR[\fP" N "\fR]\fP"
 Enable parallel hashing with
 .I N
@@ -58,7 +70,17 @@ Recommended for SSDs, NVMe drives, and network mounts.
 Not recommended for spinning disks, where concurrent reads cause seek
 thrashing.
 .TP
-.BR \-r " \fIdir\fP, " \-\-\-root " \fIdir\fP"
+.BR \-R ", " \-\-random\-order
+Check files in a randomized order.
+When combined with
+.BR \-\-max\-time ,
+the set of files checked varies between runs, converging toward full
+probabilistic coverage over many runs.
+When this flag is set, the filesystem is not scanned for new files:
+only files present in the current manifest are checked.
+A warning is printed to stderr when this flag is active.
+.TP
+.BR \-r " \fIdir\fP, " \-\-root " \fIdir\fP"
 Directory to scan.
 Default: current directory, or the parent directory of the checksum
 file if one is specified on the command line.
@@ -139,6 +161,14 @@ Check for corruption (silent if all OK):
 .RS 4
 .nf
 $ bitrot-md5
+.fi
+.RE
+.PP
+Time\-budgeted verify with randomized order:
+.PP
+.RS 4
+.nf
+$ bitrot-md5 -m 30m -R /data/backup
 .fi
 .RE
 .PP
@@ -248,15 +278,40 @@ are skipped.
 \(bu
 The checksum input and output files themselves are excluded from scanning.
 .SH EXIT STATUS
+Exit codes are bitwise\-composed from three flags (bit 0: problem
+detected, bit 4: partial run, bit 5: random\-order run).
+Code 15 is a standalone usage error.
 .TP
 .B 0
-No bit rot detected.
+No issues detected.
 .TP
 .B 1
-Bit rot detected (silent corruption).
+Bit rot or file access errors detected.
 .TP
-.B 2
+.B 15
 Usage error.
+.TP
+.B 16
+Partial run (
+.B \-\-max\-time
+exceeded, no bit rot).
+.TP
+.B 17
+Partial run (
+.B \-\-max\-time
+exceeded, bit rot detected).
+.TP
+.B 32
+Random\-order run (filesystem scan skipped), no problems.
+.TP
+.B 33
+Random\-order run (filesystem scan skipped), problems detected.
+.TP
+.B 48
+Partial and random\-order run, no problems.
+.TP
+.B 49
+Partial and random\-order run, problems detected.
 .SH ENVIRONMENT
 .TP
 .B GOMAXPROCS
@@ -273,6 +328,16 @@ irrelevant for detecting accidental corruption.
 No per\-file timestamps are stored.
 The checksum file's modification time serves as the single "last known
 good" timestamp.
+.PP
+For repositories too large to check in a single nightly window,
+.B \-\-max\-time
+with
+.B \-\-random\-order
+provides probabilistic coverage over time.
+The randomized shuffle ensures different subsets are checked each run,
+converging toward full coverage.
+Full (unbounded) runs should be performed periodically as a completeness
+backstop.
 .SH SEE ALSO
 .BR md5sum (1),
 .BR find (1)

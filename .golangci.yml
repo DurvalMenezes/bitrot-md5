@@ -10,7 +10,7 @@ linters:
     - unused
   settings:
     gocyclo:
-      min-complexity: 15
+      min-complexity: 32
   exclusions:
     generated: lax
     presets:

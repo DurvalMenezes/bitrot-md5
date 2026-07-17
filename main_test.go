@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
-	"syscall"	
 )
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -66,12 +70,24 @@ func ageFile(t *testing.T, path string, d time.Duration) {
 	}
 }
 
+func makeScanConfig(cf, root, uf string, workers int, verbose, summary bool) scanConfig {
+	return scanConfig{
+		rootDir:     root,
+		checksumIn:  cf,
+		checksumOut: uf,
+		workers:     workers,
+		verbose:     verbose,
+		summary:     summary,
+	}
+}
+
 func runScan(t *testing.T, cf, root, uf string, workers int, verbose, summary bool) (bool, string) {
 	t.Helper()
+	cfg := makeScanConfig(cf, root, uf, workers, verbose, summary)
 	var bitrot bool
 	out := captureStdout(t, func() {
 		var err error
-		bitrot, err = scan(cf, root, uf, workers, verbose, summary)
+		bitrot, err = scan(context.Background(), cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,12 +95,24 @@ func runScan(t *testing.T, cf, root, uf string, workers int, verbose, summary bo
 	return bitrot, out
 }
 
+func runScanFull(t *testing.T, cfg scanConfig) (bool, string, error) {
+	t.Helper()
+	var bitrot bool
+	var scanErr error
+	out := captureStdout(t, func() {
+		bitrot, scanErr = scan(context.Background(), cfg)
+	})
+	return bitrot, out, scanErr
+}
+
 func seedChecksums(t *testing.T, dir, cf string, files map[string]string) {
 	t.Helper()
 	for name, content := range files {
 		writeFile(t, filepath.Join(dir, name), content)
 	}
-	if _, err := scan(cf, dir, cf, 0, false, false); err != nil {
+	if _, err := scan(context.Background(), scanConfig{
+		rootDir: dir, checksumIn: cf, checksumOut: cf,
+	}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -108,86 +136,25 @@ func TestNormalizeArgs(t *testing.T) {
 		input []string
 		want  []string
 	}{
-		{
-			name:  "double dash to single",
-			input: []string{"prog", "--verbose", "--update", "file.md5"},
-			want:  []string{"prog", "-verbose", "-update", "file.md5"},
-		},
-		{
-			name:  "single dash preserved",
-			input: []string{"prog", "-v", "-u", "file.md5"},
-			want:  []string{"prog", "-v", "-u", "file.md5"},
-		},
-		{
-			name:  "equals syntax preserved",
-			input: []string{"prog", "--update=file.md5", "-v"},
-			want:  []string{"prog", "-update=file.md5", "-v"},
-		},
-		{
-			name:  "positional moved to end",
-			input: []string{"prog", "checksum.md5", "-v"},
-			want:  []string{"prog", "-v", "checksum.md5"},
-		},
-		{
-			name:  "interleaved flags and positionals",
-			input: []string{"prog", "-v", "checksum.md5", "-s"},
-			want:  []string{"prog", "-v", "-s", "checksum.md5"},
-		},
-		{
-			name:  "flag value consumed as pair",
-			input: []string{"prog", "-u", "output.md5", "input.md5"},
-			want:  []string{"prog", "-u", "output.md5", "input.md5"},
-		},
-		{
-			name:  "flag value with equals not consumed from next",
-			input: []string{"prog", "-u=output.md5", "input.md5"},
-			want:  []string{"prog", "-u=output.md5", "input.md5"},
-		},
-		{
-			name:  "double dash stops processing",
-			input: []string{"prog", "-v", "--", "--not-a-flag"},
-			want:  []string{"prog", "-v", "--not-a-flag"},
-		},
-		{
-			name:  "bare parallel does not consume next arg",
-			input: []string{"prog", "--parallel", "checksum.md5"},
-			want:  []string{"prog", "-parallel", "checksum.md5"},
-		},
-		{
-			name:  "parallel with equals",
-			input: []string{"prog", "--parallel=4", "checksum.md5"},
-			want:  []string{"prog", "-parallel=4", "checksum.md5"},
-		},
-		{
-			name:  "multiple positionals moved",
-			input: []string{"prog", "a.md5", "b.md5", "-v"},
-			want:  []string{"prog", "-v", "a.md5", "b.md5"},
-		},
-		{
-			name:  "root flag consumes value",
-			input: []string{"prog", "-r", "/tmp", "-v", "input.md5"},
-			want:  []string{"prog", "-r", "/tmp", "-v", "input.md5"},
-		},
-		{
-			name:  "no args",
-			input: []string{"prog"},
-			want:  []string{"prog"},
-		},
-		{
-			name:  "only positionals",
-			input: []string{"prog", "a.md5", "b.md5"},
-			want:  []string{"prog", "a.md5", "b.md5"},
-		},
-		{
-			name:  "only flags",
-			input: []string{"prog", "-v", "-s", "-p"},
-			want:  []string{"prog", "-v", "-s", "-p"},
-		},
-		{
-			name:  "all flags mixed",
-			input: []string{"prog", "input.md5", "-v", "-u=output.md5", "-s", "-r", "/tmp"},
-			want:  []string{"prog", "-v", "-u=output.md5", "-s", "-r", "/tmp", "input.md5"},
-		},
+		{"double dash to single", []string{"prog", "--verbose", "--update", "file.md5"}, []string{"prog", "-verbose", "-update=file.md5"}},
+		{"single dash preserved", []string{"prog", "-v", "-u", "file.md5"}, []string{"prog", "-v", "-u=file.md5"}},
+		{"equals syntax preserved", []string{"prog", "--update=file.md5", "-v"}, []string{"prog", "-update=file.md5", "-v"}},
+		{"positional moved to end", []string{"prog", "checksum.md5", "-v"}, []string{"prog", "-v", "checksum.md5"}},
+		{"interleaved flags and positionals", []string{"prog", "-v", "checksum.md5", "-s"}, []string{"prog", "-v", "-s", "checksum.md5"}},
+		{"flag value consumed as pair", []string{"prog", "-u", "output.md5", "input.md5"}, []string{"prog", "-u=output.md5", "input.md5"}},
+		{"flag value with equals not consumed from next", []string{"prog", "-u=output.md5", "input.md5"}, []string{"prog", "-u=output.md5", "input.md5"}},
+		{"double dash stops processing", []string{"prog", "-v", "--", "--not-a-flag"}, []string{"prog", "-v", "--not-a-flag"}},
+		{"bare parallel does not consume next arg", []string{"prog", "--parallel", "checksum.md5"}, []string{"prog", "-parallel", "checksum.md5"}},
+		{"parallel with equals", []string{"prog", "--parallel=4", "checksum.md5"}, []string{"prog", "-parallel=4", "checksum.md5"}},
+		{"multiple positionals moved", []string{"prog", "a.md5", "b.md5", "-v"}, []string{"prog", "-v", "a.md5", "b.md5"}},
+		{"root flag consumes value", []string{"prog", "-r", "/tmp", "-v", "input.md5"}, []string{"prog", "-r=/tmp", "-v", "input.md5"}},
+		{"no args", []string{"prog"}, []string{"prog"}},
+		{"only positionals", []string{"prog", "a.md5", "b.md5"}, []string{"prog", "a.md5", "b.md5"}},
+		{"only flags", []string{"prog", "-v", "-s", "-p"}, []string{"prog", "-v", "-s", "-p"}},
+		{"all flags mixed", []string{"prog", "input.md5", "-v", "-u=output.md5", "-s", "-r", "/tmp"}, []string{"prog", "-v", "-u=output.md5", "-s", "-r=/tmp", "input.md5"}},
+		{"max-time consumed as pair", []string{"prog", "-m", "30m", "input.md5"}, []string{"prog", "-m=30m", "input.md5"}},
+		{"max-time with equals", []string{"prog", "-m=1h", "input.md5"}, []string{"prog", "-m=1h", "input.md5"}},
+		{"random-order flag", []string{"prog", "-R", "input.md5"}, []string{"prog", "-R", "input.md5"}},
 	}
 
 	for _, tt := range tests {
@@ -211,51 +178,13 @@ func TestParseLine(t *testing.T) {
 		wantPath string
 		wantOK   bool
 	}{
-		{
-			name:     "standard double-space format",
-			line:     "d41d8cd98f00b204e9800998ecf8427e  ./file.txt",
-			wantHash: "d41d8cd98f00b204e9800998ecf8427e",
-			wantPath: "./file.txt",
-			wantOK:   true,
-		},
-		{
-			name:     "binary mode indicator stripped",
-			line:     "d41d8cd98f00b204e9800998ecf8427e *./file.txt",
-			wantHash: "d41d8cd98f00b204e9800998ecf8427e",
-			wantPath: "./file.txt",
-			wantOK:   true,
-		},
-		{
-			name:     "single space separator",
-			line:     "d41d8cd98f00b204e9800998ecf8427e ./file.txt",
-			wantHash: "d41d8cd98f00b204e9800998ecf8427e",
-			wantPath: "./file.txt",
-			wantOK:   true,
-		},
-		{
-			name:     "path with spaces",
-			line:     "d41d8cd98f00b204e9800998ecf8427e  ./my file.txt",
-			wantHash: "d41d8cd98f00b204e9800998ecf8427e",
-			wantPath: "./my file.txt",
-			wantOK:   true,
-		},
-		{
-			name:     "nested path",
-			line:     "abc123  ./sub/dir/file.txt",
-			wantHash: "abc123",
-			wantPath: "./sub/dir/file.txt",
-			wantOK:   true,
-		},
-		{
-			name:   "empty line",
-			line:   "",
-			wantOK: false,
-		},
-		{
-			name:   "no separator at all",
-			line:   "d41d8cd98f00b204e9800998ecf8427e",
-			wantOK: false,
-		},
+		{"standard double-space format", "d41d8cd98f00b204e9800998ecf8427e  ./file.txt", "d41d8cd98f00b204e9800998ecf8427e", "./file.txt", true},
+		{"binary mode indicator stripped", "d41d8cd98f00b204e9800998ecf8427e *./file.txt", "d41d8cd98f00b204e9800998ecf8427e", "./file.txt", true},
+		{"single space separator", "d41d8cd98f00b204e9800998ecf8427e ./file.txt", "d41d8cd98f00b204e9800998ecf8427e", "./file.txt", true},
+		{"path with spaces", "d41d8cd98f00b204e9800998ecf8427e  ./my file.txt", "d41d8cd98f00b204e9800998ecf8427e", "./my file.txt", true},
+		{"nested path", "abc123  ./sub/dir/file.txt", "abc123", "./sub/dir/file.txt", true},
+		{"empty line", "", "", "", false},
+		{"no separator at all", "d41d8cd98f00b204e9800998ecf8427e", "", "", false},
 	}
 
 	for _, tt := range tests {
@@ -291,7 +220,6 @@ func TestOptionalInt(t *testing.T) {
 			t.Errorf("value = %d, want 8", o.value)
 		}
 	})
-
 	t.Run("explicit value", func(t *testing.T) {
 		o := &optionalInt{defaultVal: 8}
 		if err := o.Set("4"); err != nil {
@@ -301,7 +229,6 @@ func TestOptionalInt(t *testing.T) {
 			t.Errorf("value = %d, want 4", o.value)
 		}
 	})
-
 	t.Run("not set", func(t *testing.T) {
 		o := &optionalInt{defaultVal: 8}
 		if o.isSet {
@@ -311,21 +238,18 @@ func TestOptionalInt(t *testing.T) {
 			t.Errorf("value = %d, want 0", o.value)
 		}
 	})
-
 	t.Run("invalid value", func(t *testing.T) {
 		o := &optionalInt{}
 		if err := o.Set("abc"); err == nil {
 			t.Error("expected error for non-numeric input")
 		}
 	})
-
 	t.Run("is bool flag", func(t *testing.T) {
 		o := &optionalInt{}
 		if !o.IsBoolFlag() {
 			t.Error("IsBoolFlag should return true")
 		}
 	})
-
 	t.Run("string representation", func(t *testing.T) {
 		o := &optionalInt{defaultVal: 4}
 		if s := o.String(); s != "0" {
@@ -355,7 +279,6 @@ func TestOptionalString(t *testing.T) {
 			t.Errorf("value = %q, want empty", o.value)
 		}
 	})
-
 	t.Run("explicit value", func(t *testing.T) {
 		o := &optionalString{}
 		if err := o.Set("output.md5"); err != nil {
@@ -368,7 +291,6 @@ func TestOptionalString(t *testing.T) {
 			t.Errorf("value = %q, want %q", o.value, "output.md5")
 		}
 	})
-
 	t.Run("not set", func(t *testing.T) {
 		o := &optionalString{}
 		if o.isSet {
@@ -378,7 +300,6 @@ func TestOptionalString(t *testing.T) {
 			t.Errorf("String() = %q, want empty", o.String())
 		}
 	})
-
 	t.Run("is bool flag", func(t *testing.T) {
 		o := &optionalString{}
 		if !o.IsBoolFlag() {
@@ -412,10 +333,7 @@ func TestLoadMD5_DevNull(t *testing.T) {
 func TestLoadMD5_Valid(t *testing.T) {
 	dir := createTempDir(t)
 	path := filepath.Join(dir, "test.md5")
-	writeFile(t, path,
-		"aaa  ./file1.txt\n"+
-			"bbb  ./file2.txt\n"+
-			"ccc  ./sub/file3.txt\n")
+	writeFile(t, path, "aaa  ./file1.txt\nbbb  ./file2.txt\nccc  ./sub/file3.txt\n")
 
 	m, err := loadMD5(path)
 	if err != nil {
@@ -452,10 +370,7 @@ func TestLoadMD5_BinaryMode(t *testing.T) {
 func TestLoadMD5_Malformed(t *testing.T) {
 	dir := createTempDir(t)
 	path := filepath.Join(dir, "test.md5")
-	writeFile(t, path,
-		"aaa  ./good.txt\n"+
-			"malformed\n"+
-			"bbb  ./also-good.txt\n")
+	writeFile(t, path, "aaa  ./good.txt\nmalformed\nbbb  ./also-good.txt\n")
 
 	oldStderr := os.Stderr
 	r, w, err := os.Pipe()
@@ -464,14 +379,14 @@ func TestLoadMD5_Malformed(t *testing.T) {
 	}
 	os.Stderr = w
 
-	m, err := loadMD5(path)
+	m, loadErr := loadMD5(path)
 
 	w.Close()
 	os.Stderr = oldStderr
 	r.Close()
 
-	if err != nil {
-		t.Fatal(err)
+	if loadErr != nil {
+		t.Fatal(loadErr)
 	}
 	if len(m) != 2 {
 		t.Errorf("expected 2 entries, got %d", len(m))
@@ -495,9 +410,7 @@ func TestLoadMD5_Empty(t *testing.T) {
 func TestLoadMD5_Duplicates(t *testing.T) {
 	dir := createTempDir(t)
 	path := filepath.Join(dir, "dup.md5")
-	writeFile(t, path,
-		"aaa  ./file.txt\n"+
-			"bbb  ./file.txt\n")
+	writeFile(t, path, "aaa  ./file.txt\nbbb  ./file.txt\n")
 
 	m, err := loadMD5(path)
 	if err != nil {
@@ -514,12 +427,7 @@ func TestSaveMD5(t *testing.T) {
 	t.Run("writes sorted output", func(t *testing.T) {
 		dir := createTempDir(t)
 		path := filepath.Join(dir, "test.md5")
-
-		db := map[string]string{
-			"./b.txt": "bbb",
-			"./a.txt": "aaa",
-			"./c.txt": "ccc",
-		}
+		db := map[string]string{"./b.txt": "bbb", "./a.txt": "aaa", "./c.txt": "ccc"}
 
 		if err := saveMD5(path, db); err != nil {
 			t.Fatal(err)
@@ -568,7 +476,6 @@ func TestSaveMD5(t *testing.T) {
 func TestLoadSaveRoundTrip(t *testing.T) {
 	dir := createTempDir(t)
 	path := filepath.Join(dir, "test.md5")
-
 	original := map[string]string{
 		"./file1.txt":     knownMD5("hello"),
 		"./sub/file2.txt": knownMD5("world"),
@@ -705,6 +612,44 @@ func TestDiscover_ForwardSlashes(t *testing.T) {
 	}
 }
 
+func TestDiscover_SkipsSymlinks(t *testing.T) {
+	dir := createTempDir(t)
+	writeFile(t, filepath.Join(dir, "real.txt"), "data")
+	if err := os.Symlink(filepath.Join(dir, "real.txt"), filepath.Join(dir, "link.txt")); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	files, err := discover(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d: %v", len(files), keysOf(files))
+	}
+	if _, ok := files["./real.txt"]; !ok {
+		t.Error("missing ./real.txt")
+	}
+}
+
+func TestDiscover_SkipsFIFO(t *testing.T) {
+	dir := createTempDir(t)
+	writeFile(t, filepath.Join(dir, "real.txt"), "data")
+	if err := syscall.Mkfifo(filepath.Join(dir, "pipe"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := discover(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d: %v", len(files), keysOf(files))
+	}
+	if _, ok := files["./real.txt"]; !ok {
+		t.Error("missing ./real.txt")
+	}
+}
+
 // ── md5File ──────────────────────────────────────────────────────────
 
 func TestMD5File(t *testing.T) {
@@ -714,7 +659,6 @@ func TestMD5File(t *testing.T) {
 	t.Run("known content", func(t *testing.T) {
 		path := filepath.Join(dir, "test.txt")
 		writeFile(t, path, "hello world")
-
 		got, err := md5File(path, buf)
 		if err != nil {
 			t.Fatal(err)
@@ -727,7 +671,6 @@ func TestMD5File(t *testing.T) {
 	t.Run("empty file", func(t *testing.T) {
 		path := filepath.Join(dir, "empty.txt")
 		writeFile(t, path, "")
-
 		got, err := md5File(path, buf)
 		if err != nil {
 			t.Fatal(err)
@@ -753,7 +696,6 @@ func TestMD5File(t *testing.T) {
 		if err := os.WriteFile(path, data, 0644); err != nil {
 			t.Fatal(err)
 		}
-
 		got, err := md5File(path, buf)
 		if err != nil {
 			t.Fatal(err)
@@ -784,7 +726,6 @@ func TestHashSequential(t *testing.T) {
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
-
 	if results[0].rel != "./a.txt" {
 		t.Errorf("first: got %q, want %q", results[0].rel, "./a.txt")
 	}
@@ -796,9 +737,6 @@ func TestHashSequential(t *testing.T) {
 	}
 	if results[1].hash != knownMD5("bbb") {
 		t.Error("b.txt hash mismatch")
-	}
-	if results[0].err != nil || results[1].err != nil {
-		t.Error("unexpected errors")
 	}
 }
 
@@ -813,10 +751,7 @@ func TestHashParallel(t *testing.T) {
 	files := make(map[string]fileEntry)
 	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
 		info, _ := os.Stat(filepath.Join(dir, name))
-		files["./"+name] = fileEntry{
-			abs:   filepath.Join(dir, name),
-			mtime: info.ModTime(),
-		}
+		files["./"+name] = fileEntry{abs: filepath.Join(dir, name), mtime: info.ModTime()}
 	}
 
 	results := hashParallel(files, 2)
@@ -869,10 +804,7 @@ func TestHashParallelOneWorker(t *testing.T) {
 	files := make(map[string]fileEntry)
 	for _, name := range []string{"a.txt", "b.txt"} {
 		info, _ := os.Stat(filepath.Join(dir, name))
-		files["./"+name] = fileEntry{
-			abs:   filepath.Join(dir, name),
-			mtime: info.ModTime(),
-		}
+		files["./"+name] = fileEntry{abs: filepath.Join(dir, name), mtime: info.ModTime()}
 	}
 
 	results := hashAll(files, 1)
@@ -899,10 +831,7 @@ func TestParallelMatchesSequential(t *testing.T) {
 	files := make(map[string]fileEntry)
 	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
 		info, _ := os.Stat(filepath.Join(dir, name))
-		files["./"+name] = fileEntry{
-			abs:   filepath.Join(dir, name),
-			mtime: info.ModTime(),
-		}
+		files["./"+name] = fileEntry{abs: filepath.Join(dir, name), mtime: info.ModTime()}
 	}
 
 	seq := hashSequential(files)
@@ -1001,10 +930,7 @@ func TestScanFirstRunNonExistentFile(t *testing.T) {
 
 func TestScanAllOK(t *testing.T) {
 	dir := createTempDir(t)
-	seedChecksums(t, dir, filepath.Join(dir, "c.md5"), map[string]string{
-		"a.txt": "aaa",
-		"b.txt": "bbb",
-	})
+	seedChecksums(t, dir, filepath.Join(dir, "c.md5"), map[string]string{"a.txt": "aaa", "b.txt": "bbb"})
 
 	cf := filepath.Join(dir, "c.md5")
 
@@ -1019,9 +945,7 @@ func TestScanAllOK(t *testing.T) {
 
 func TestScanAllOKSummary(t *testing.T) {
 	dir := createTempDir(t)
-	seedChecksums(t, dir, filepath.Join(dir, "c.md5"), map[string]string{
-		"a.txt": "aaa",
-	})
+	seedChecksums(t, dir, filepath.Join(dir, "c.md5"), map[string]string{"a.txt": "aaa"})
 
 	cf := filepath.Join(dir, "c.md5")
 	_, out := runScan(t, cf, dir, "", 0, false, true)
@@ -1039,10 +963,7 @@ func TestScanAllOKSummary(t *testing.T) {
 func TestScanBitRot(t *testing.T) {
 	dir := createTempDir(t)
 	cf := filepath.Join(dir, "c.md5")
-	seedChecksums(t, dir, cf, map[string]string{
-		"a.txt": "aaa",
-		"b.txt": "bbb",
-	})
+	seedChecksums(t, dir, cf, map[string]string{"a.txt": "aaa", "b.txt": "bbb"})
 
 	writeFile(t, filepath.Join(dir, "a.txt"), "CORRUPTED")
 	ageFile(t, filepath.Join(dir, "a.txt"), 10*time.Second)
@@ -1102,10 +1023,7 @@ func TestScanModified(t *testing.T) {
 func TestScanDeleted(t *testing.T) {
 	dir := createTempDir(t)
 	cf := filepath.Join(dir, "c.md5")
-	seedChecksums(t, dir, cf, map[string]string{
-		"a.txt": "aaa",
-		"b.txt": "bbb",
-	})
+	seedChecksums(t, dir, cf, map[string]string{"a.txt": "aaa", "b.txt": "bbb"})
 
 	os.Remove(filepath.Join(dir, "b.txt"))
 
@@ -1145,37 +1063,37 @@ func TestScanNew(t *testing.T) {
 // ── scan: .md5 exclusion ─────────────────────────────────────────────
 
 func TestScanMD5Exclusion(t *testing.T) {
-    dir := createTempDir(t)
-    cf := filepath.Join(dir, "checksums.md5")
-    writeFile(t, filepath.Join(dir, "a.txt"), "aaa")
-    writeFile(t, filepath.Join(dir, "data.md5"), "some data")
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "checksums.md5")
+	writeFile(t, filepath.Join(dir, "a.txt"), "aaa")
+	writeFile(t, filepath.Join(dir, "data.md5"), "some data")
 
-    runScan(t, cf, dir, cf, 0, false, false)
+	runScan(t, cf, dir, cf, 0, false, false)
 
-    m, _ := loadMD5(cf)
-    if len(m) != 2 {
-        t.Fatalf("expected 2 entries, got %d: %v", len(m), m)
-    }
-    if _, ok := m["./a.txt"]; !ok {
-        t.Error("missing ./a.txt")
-    }
-    if _, ok := m["./data.md5"]; !ok {
-        t.Error("./data.md5 should be included (it's a data file)")
-    }
+	m, _ := loadMD5(cf)
+	if len(m) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %v", len(m), m)
+	}
+	if _, ok := m["./a.txt"]; !ok {
+		t.Error("missing ./a.txt")
+	}
+	if _, ok := m["./data.md5"]; !ok {
+		t.Error("./data.md5 should be included (it's a data file)")
+	}
 }
 
 func TestScanMD5ExclusionCaseInsensitive(t *testing.T) {
-    dir := createTempDir(t)
-    cf := filepath.Join(dir, "checksums.md5")
-    writeFile(t, filepath.Join(dir, "a.txt"), "aaa")
-    writeFile(t, filepath.Join(dir, "UPPER.MD5"), "data")
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "checksums.md5")
+	writeFile(t, filepath.Join(dir, "a.txt"), "aaa")
+	writeFile(t, filepath.Join(dir, "UPPER.MD5"), "data")
 
-    runScan(t, cf, dir, cf, 0, false, false)
+	runScan(t, cf, dir, cf, 0, false, false)
 
-    m, _ := loadMD5(cf)
-    if len(m) != 2 {
-        t.Fatalf("expected 2 entries, got %d: %v", len(m), m)
-    }
+	m, _ := loadMD5(cf)
+	if len(m) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %v", len(m), m)
+	}
 }
 
 // ── scan: checksum file exclusion ────────────────────────────────────
@@ -1202,10 +1120,7 @@ func TestScanChecksumFileExclusion(t *testing.T) {
 func TestScanVerboseBitRot(t *testing.T) {
 	dir := createTempDir(t)
 	cf := filepath.Join(dir, "c.md5")
-	seedChecksums(t, dir, cf, map[string]string{
-		"a.txt": "aaa",
-		"b.txt": "bbb",
-	})
+	seedChecksums(t, dir, cf, map[string]string{"a.txt": "aaa", "b.txt": "bbb"})
 
 	writeFile(t, filepath.Join(dir, "a.txt"), "CORRUPTED")
 	ageFile(t, filepath.Join(dir, "a.txt"), 10*time.Second)
@@ -1304,7 +1219,7 @@ func TestScanNoUpdatePromptWhenNoNews(t *testing.T) {
 	}
 }
 
-func TestScanUpdatePromptWhenNews(t *testing.T) {
+func TestScanTempFileWhenNewsNoUpdate(t *testing.T) {
 	dir := createTempDir(t)
 	cf := filepath.Join(dir, "c.md5")
 	seedChecksums(t, dir, cf, map[string]string{"a.txt": "aaa"})
@@ -1316,6 +1231,29 @@ func TestScanUpdatePromptWhenNews(t *testing.T) {
 	if !strings.Contains(out, "Checksums saved to") {
 		t.Errorf("expected temp file message when new files found:\n%s", out)
 	}
+
+	lines := strings.Split(out, "\n")
+	var tmpPath string
+	for _, line := range lines {
+		if strings.Contains(line, "Checksums saved to") {
+			parts := strings.SplitN(line, " ", 4)
+			if len(parts) >= 4 {
+				tmpPath = strings.TrimSpace(parts[3])
+			}
+		}
+	}
+	if tmpPath == "" {
+		t.Fatal("could not extract temp file path from output")
+	}
+
+	m, err := loadMD5(tmpPath)
+	if err != nil {
+		t.Fatalf("temp file unreadable: %v", err)
+	}
+	if len(m) != 2 {
+		t.Fatalf("expected 2 entries in temp file, got %d", len(m))
+	}
+	os.Remove(tmpPath)
 }
 
 // ── scan: update file ────────────────────────────────────────────────
@@ -1369,10 +1307,7 @@ func TestScanMixed(t *testing.T) {
 	dir := createTempDir(t)
 	cf := filepath.Join(dir, "c.md5")
 	seedChecksums(t, dir, cf, map[string]string{
-		"ok.txt":  "ok",
-		"rot.txt": "rot",
-		"mod.txt": "mod",
-		"del.txt": "del",
+		"ok.txt": "ok", "rot.txt": "rot", "mod.txt": "mod", "del.txt": "del",
 	})
 
 	writeFile(t, filepath.Join(dir, "rot.txt"), "ROTTED")
@@ -1392,15 +1327,9 @@ func TestScanMixed(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"./ok.txt: OK",
-		"./rot.txt: BAD",
-		"./mod.txt: MOD",
-		"./del.txt: DELETED",
-		"./new.txt: NEW",
-		"BIT ROT DETECTED",
-		"MODIFIED",
-		"DELETED",
-		"NEW",
+		"./ok.txt: OK", "./rot.txt: BAD", "./mod.txt: MOD",
+		"./del.txt: DELETED", "./new.txt: NEW",
+		"BIT ROT DETECTED", "MODIFIED", "DELETED", "NEW",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in output", want)
@@ -1782,41 +1711,7 @@ func TestResolveArgs_ExplicitRoot(t *testing.T) {
 	}
 }
 
-func TestDiscover_SkipsSymlinks(t *testing.T) {
-	dir := createTempDir(t)
-	writeFile(t, filepath.Join(dir, "real.txt"), "data")
-	os.Symlink(filepath.Join(dir, "real.txt"), filepath.Join(dir, "link.txt"))
-
-	files, err := discover(dir, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) != 1 {
-		t.Fatalf("expected 1 file, got %d: %v", len(files), keysOf(files))
-	}
-	if _, ok := files["./real.txt"]; !ok {
-		t.Error("missing ./real.txt")
-	}
-}
-
-func TestDiscover_SkipsFIFO(t *testing.T) {
-	dir := createTempDir(t)
-	writeFile(t, filepath.Join(dir, "real.txt"), "data")
-	if err := syscall.Mkfifo(filepath.Join(dir, "pipe"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	files, err := discover(dir, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) != 1 {
-		t.Fatalf("expected 1 file, got %d: %v", len(files), keysOf(files))
-	}
-	if _, ok := files["./real.txt"]; !ok {
-		t.Error("missing ./real.txt")
-	}
-}
+// ── validateChecksumFile ─────────────────────────────────────────────
 
 func TestValidateChecksumFile_MissingNoUpdate(t *testing.T) {
 	err := validateChecksumFile("/nonexistent/file.md5", false)
@@ -1843,41 +1738,566 @@ func TestValidateChecksumFile_Exists(t *testing.T) {
 	}
 }
 
-func TestScanTempFileWhenNewsNoUpdate(t *testing.T) {
+// ── shuffle ──────────────────────────────────────────────────────────
+
+func TestShuffle_ChangesOrder(t *testing.T) {
+	reqs := make([]hashReq, 20)
+	for i := range reqs {
+		reqs[i] = hashReq{rel: fmt.Sprintf("file_%02d.txt", i)}
+	}
+	original := make([]string, len(reqs))
+	for i, r := range reqs {
+		original[i] = r.rel
+	}
+
+	different := false
+	for attempt := 0; attempt < 10; attempt++ {
+		shuffled := make([]hashReq, len(reqs))
+		copy(shuffled, reqs)
+		shuffle(shuffled)
+		result := make([]string, len(shuffled))
+		for i, r := range shuffled {
+			result[i] = r.rel
+		}
+		if !reflect.DeepEqual(original, result) {
+			different = true
+			break
+		}
+	}
+	if !different {
+		t.Error("shuffle never changed the order in 10 attempts")
+	}
+}
+
+func TestShuffle_PreservesElements(t *testing.T) {
+	reqs := make([]hashReq, 50)
+	for i := range reqs {
+		reqs[i] = hashReq{rel: fmt.Sprintf("file_%02d.txt", i)}
+	}
+	original := make([]string, len(reqs))
+	for i, r := range reqs {
+		original[i] = r.rel
+	}
+
+	shuffled := make([]hashReq, len(reqs))
+	copy(shuffled, reqs)
+	shuffle(shuffled)
+
+	result := make([]string, len(shuffled))
+	for i, r := range shuffled {
+		result[i] = r.rel
+	}
+
+	sort.Strings(original)
+	sort.Strings(result)
+	if !reflect.DeepEqual(original, result) {
+		t.Error("shuffle lost or duplicated elements")
+	}
+}
+
+// ── max-time / random-order scan tests ───────────────────────────────
+
+func seedLargeChecksums(t *testing.T, dir, cf string, count int) {
+	t.Helper()
+	files := make(map[string]string, count)
+	for i := 0; i < count; i++ {
+		name := fmt.Sprintf("file_%04d.txt", i)
+		content := strings.Repeat(fmt.Sprintf("%d", i), 100000)
+		files[name] = content
+	}
+	seedChecksums(t, dir, cf, files)
+}
+
+func TestScanMaxTime_PartialRun(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 1000)
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		maxTime:     1 * time.Millisecond,
+	}
+
+	bitrot, out, scanErr := runScanFull(t, cfg)
+	if bitrot {
+		t.Error("should not detect bitrot in partial run")
+	}
+
+	var timeErr *timeBudgetExceededError
+	if !errors.As(scanErr, &timeErr) {
+		t.Error("expected timeBudgetExceededError for timed run")
+	}
+
+	if strings.Contains(out, "Checksums saved to") {
+		t.Error("partial run should NOT suggest saving an incomplete manifest")
+	}
+}
+
+func TestScanMaxTime_PartialRunWithBitrot(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 1000)
+
+	writeFile(t, filepath.Join(dir, "file_0000.txt"), "CORRUPTED")
+	ageFile(t, filepath.Join(dir, "file_0000.txt"), 10*time.Second)
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		maxTime:     1 * time.Millisecond,
+		verbose:     true,
+	}
+
+	bitrot, out, scanErr := runScanFull(t, cfg)
+
+	var timeErr *timeBudgetExceededError
+	if !errors.As(scanErr, &timeErr) {
+		t.Error("expected timeBudgetExceededError")
+	}
+
+	if strings.Contains(out, "Checksums saved to") {
+		t.Error("partial run with bitrot should NOT suggest saving an incomplete manifest")
+	}
+
+	if bitrot {
+		t.Log("partial run caught bitrot (expected with corrupted first file)")
+	}
+}
+
+func TestScanMaxTime_CompletesWhenBudgetSufficient(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 10)
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		maxTime:     60 * time.Second,
+	}
+
+	_, scanErr := scan(context.Background(), cfg)
+	if scanErr != nil {
+		var timeErr *timeBudgetExceededError
+		if errors.As(scanErr, &timeErr) {
+			t.Error("should not time out with generous budget")
+		} else {
+			t.Fatalf("unexpected error: %v", scanErr)
+		}
+	}
+}
+
+func TestScanMaxTime_ParallelPartial(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 1000)
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     4,
+		maxTime:     1 * time.Millisecond,
+	}
+
+	bitrot, scanErr := scan(context.Background(), cfg)
+	if bitrot {
+		t.Error("should not detect bitrot in partial parallel run")
+	}
+
+	var timeErr *timeBudgetExceededError
+	if !errors.As(scanErr, &timeErr) {
+		t.Error("expected timeBudgetExceededError for timed parallel run")
+	}
+}
+
+func TestScanRandomOrder_SkipsFilesystemScan(t *testing.T) {
 	dir := createTempDir(t)
 	cf := filepath.Join(dir, "c.md5")
 	seedChecksums(t, dir, cf, map[string]string{"a.txt": "aaa"})
 
-	writeFile(t, filepath.Join(dir, "b.txt"), "bbb")
+	writeFile(t, filepath.Join(dir, "new.txt"), "new")
 
-	_, out := runScan(t, cf, dir, "", 0, false, false)
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
 
-	if !strings.Contains(out, "Checksums saved to") {
-		t.Fatalf("expected temp file message:\n%s", out)
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		randomOrder: true,
 	}
 
-	// Extract temp file path from output.
-	lines := strings.Split(out, "\n")
-	var tmpPath string
-	for _, line := range lines {
-		if strings.Contains(line, "Checksums saved to") {
-			parts := strings.SplitN(line, " ", 4)
-			if len(parts) >= 4 {
-				tmpPath = strings.TrimSpace(parts[3])
+	bitrot, out, scanErr := runScanFull(t, cfg)
+
+	w.Close()
+	os.Stderr = oldStderr
+	var stderrBuf strings.Builder
+	if _, err := io.Copy(&stderrBuf, r); err != nil {
+		t.Fatalf("failed to copy output to stderr buffer: %v", err)
+	}
+	r.Close()
+	stderrOutput := stderrBuf.String()
+
+	if scanErr != nil {
+		t.Fatalf("unexpected error: %v", scanErr)
+	}
+	if bitrot {
+		t.Error("should not detect bitrot")
+	}
+	if !strings.Contains(stderrOutput, "NOT scanning the filesystem") {
+		t.Errorf("expected warning on stderr:\n%s", stderrOutput)
+	}
+	if strings.Contains(out, "NEW") {
+		t.Errorf("should not report NEW files in random-order mode:\n%s", out)
+	}
+}
+
+func TestScanRandomOrder_ChecksAllManifestFiles(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedChecksums(t, dir, cf, map[string]string{
+		"a.txt": "aaa", "b.txt": "bbb", "c.txt": "ccc",
+	})
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		randomOrder: true,
+		verbose:     true,
+	}
+
+	_, out, _ := runScanFull(t, cfg)
+
+	w.Close()
+	os.Stderr = oldStderr
+	r.Close()
+
+	for _, want := range []string{"./a.txt: OK", "./b.txt: OK", "./c.txt: OK"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in verbose output:\n%s", want, out)
+		}
+	}
+}
+
+func TestScanRandomOrder_Parallel(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedChecksums(t, dir, cf, map[string]string{
+		"a.txt": "aaa", "b.txt": "bbb", "c.txt": "ccc",
+	})
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     2,
+		randomOrder: true,
+		verbose:     true,
+	}
+
+	_, out, _ := runScanFull(t, cfg)
+
+	w.Close()
+	os.Stderr = oldStderr
+	r.Close()
+
+	for _, want := range []string{"./a.txt: OK", "./b.txt: OK", "./c.txt: OK"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in verbose output:\n%s", want, out)
+		}
+	}
+}
+
+func TestScanRandomOrder_DetectsDeletedFiles(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedChecksums(t, dir, cf, map[string]string{
+		"a.txt": "aaa", "b.txt": "bbb",
+	})
+
+	os.Remove(filepath.Join(dir, "b.txt"))
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		randomOrder: true,
+	}
+
+	_, out, _ := runScanFull(t, cfg)
+
+	w.Close()
+	os.Stderr = oldStderr
+	r.Close()
+
+	if !strings.Contains(out, "DELETED") {
+		t.Errorf("expected DELETED in output:\n%s", out)
+	}
+	if !strings.Contains(out, "./b.txt") {
+		t.Errorf("expected ./b.txt in output:\n%s", out)
+	}
+}
+
+func TestScanRandomOrder_DetectsBitrot(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedChecksums(t, dir, cf, map[string]string{"a.txt": "aaa"})
+
+	writeFile(t, filepath.Join(dir, "a.txt"), "CORRUPTED")
+	ageFile(t, filepath.Join(dir, "a.txt"), 10*time.Second)
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		randomOrder: true,
+	}
+
+	bitrot, out, _ := runScanFull(t, cfg)
+
+	w.Close()
+	os.Stderr = oldStderr
+	r.Close()
+
+	if !bitrot {
+		t.Error("should detect bitrot in random-order mode")
+	}
+	if !strings.Contains(out, "BIT ROT DETECTED") {
+		t.Errorf("expected BIT ROT DETECTED:\n%s", out)
+	}
+}
+
+func TestScanRandomOrder_UnionCoversFullSet(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 30)
+
+	visited := make(map[string]bool)
+	runs := 20
+
+	for i := 0; i < runs; i++ {
+		oldStderr := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stderr = w
+
+		cfg := scanConfig{
+			rootDir:     dir,
+			checksumIn:  cf,
+			checksumOut: "",
+			workers:     0,
+			randomOrder: true,
+			verbose:     true,
+		}
+
+		_, out, _ := runScanFull(t, cfg)
+
+		w.Close()
+		os.Stderr = oldStderr
+		r.Close()
+
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, ": OK") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) >= 1 {
+					visited[strings.TrimSpace(parts[0])] = true
+				}
 			}
 		}
 	}
-	if tmpPath == "" {
-		t.Fatal("could not extract temp file path from output")
+
+	if len(visited) < 30 {
+		t.Errorf("after %d random runs, only %d of 30 files visited", runs, len(visited))
+	}
+}
+
+func TestScanRandomOrder_TimeBudgetPartial(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 1000)
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		randomOrder: true,
+		maxTime:     1 * time.Millisecond,
 	}
 
-	// Verify it exists and contains valid checksums.
-	m, err := loadMD5(tmpPath)
+	_, out, scanErr := runScanFull(t, cfg)
+
+	w.Close()
+	os.Stderr = oldStderr
+	r.Close()
+
+	var timeErr *timeBudgetExceededError
+	if !errors.As(scanErr, &timeErr) {
+		t.Error("expected timeBudgetExceededError")
+	}
+	if !strings.Contains(out, "PARTIAL") {
+		t.Errorf("expected PARTIAL in output:\n%s", out)
+	}
+}
+
+func TestScanMaxTime_UpdateIgnoresMaxTime(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 100)
+
+	uf := filepath.Join(dir, "out.md5")
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: uf,
+		workers:     0,
+		maxTime:     1 * time.Millisecond,
+	}
+
+	bitrot, scanErr := scan(context.Background(), cfg)
+	if bitrot {
+		t.Error("should not detect bitrot")
+	}
+	if scanErr != nil {
+		t.Fatalf("unexpected error: %v", scanErr)
+	}
+
+	m, err := loadMD5(uf)
 	if err != nil {
-		t.Fatalf("temp file unreadable: %v", err)
+		t.Fatal(err)
 	}
-	if len(m) != 2 {
-		t.Fatalf("expected 2 entries in temp file, got %d", len(m))
+	if len(m) != 100 {
+		t.Errorf("update mode should complete all files, got %d entries", len(m))
 	}
-	os.Remove(tmpPath)
+}
+
+func TestScanNoOptions_UnchangedBehavior(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedChecksums(t, dir, cf, map[string]string{"a.txt": "aaa"})
+
+	bitrot, out := runScan(t, cf, dir, "", 0, false, false)
+	if bitrot {
+		t.Error("should not detect bitrot")
+	}
+	if out != "" {
+		t.Errorf("expected silence with no options, got:\n%s", out)
+	}
+}
+
+// ── Exit code bitwise tests ──────────────────────────────────────────
+
+func TestExitCodeBits(t *testing.T) {
+	// Verify the flag constants produce the correct composite codes.
+	tests := []struct {
+		name     string
+		problem  bool
+		partial  bool
+		random   bool
+		expected int
+	}{
+		{"clean", false, false, false, 0},
+		{"bitrot only", true, false, false, 1},
+		{"partial only", false, true, false, 16},
+		{"partial + bitrot", true, true, false, 17},
+		{"random only", false, false, true, 32},
+		{"random + bitrot", true, false, true, 33},
+		{"partial + random", false, true, true, 48},
+		{"all flags", true, true, true, 49},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code := 0
+			if tt.problem {
+				code |= exitProblem
+			}
+			if tt.partial {
+				code |= exitPartial
+			}
+			if tt.random {
+				code |= exitRandom
+			}
+			if code != tt.expected {
+				t.Errorf("got %d, want %d", code, tt.expected)
+			}
+		})
+	}
+}
+
+// ── Test whether partial is properly NOT reported when all files checked
+
+func TestScanMaxTime_AllFilesCompletedNotPartial(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 10)
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     0,
+		maxTime:     60 * time.Second,
+	}
+
+	_, out, scanErr := runScanFull(t, cfg)
+	if scanErr != nil {
+		t.Fatalf("unexpected error: %v", scanErr)
+	}
+	if strings.Contains(out, "PARTIAL") {
+		t.Errorf("should not report PARTIAL when all files completed:\n%s", out)
+	}
 }

@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,6 +21,14 @@ import (
 )
 
 const bufSize = 64 << 10
+
+// Exit code flag bits.
+const (
+	exitProblem = 1 // bit rot or file access errors detected
+	exitUsage   = 15
+	exitPartial = 16 // --max-time exceeded
+	exitRandom  = 32 // --random-order, filesystem scan skipped
+)
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -53,6 +64,24 @@ type scanResult struct {
 
 func (r scanResult) hasNews() bool {
 	return r.problem || len(r.modified) > 0 || len(r.deleted) > 0 || len(r.added) > 0
+}
+
+type scanConfig struct {
+	rootDir         string
+	checksumIn      string
+	checksumOut     string
+	workers         int
+	verbose         bool
+	summary         bool
+	randomOrder     bool
+	maxTime         time.Duration
+	totalFilesInOld int
+}
+
+type timeBudgetExceededError struct{}
+
+func (e *timeBudgetExceededError) Error() string {
+	return "time budget exceeded"
 }
 
 type optionalInt struct {
@@ -106,9 +135,10 @@ func (o *optionalString) IsBoolFlag() bool { return true }
 // ── Argument preprocessing ───────────────────────────────────────────
 
 func normalizeArgs() {
-	takesValue := map[string]bool{
+	requiresValue := map[string]bool{
 		"root": true, "r": true,
 		"update": true, "u": true,
+		"max-time": true, "m": true,
 	}
 
 	var flags []string
@@ -141,13 +171,15 @@ func normalizeArgs() {
 			name = trimmed[:idx]
 		}
 
+		if requiresValue[name] && !strings.Contains(arg, "=") &&
+			i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			flags = append(flags, normalized+"="+args[i+1])
+			i += 2
+			continue
+		}
+
 		flags = append(flags, normalized)
 		i++
-
-		if takesValue[name] && !strings.Contains(arg, "=") && i < len(args) {
-			flags = append(flags, args[i])
-			i++
-		}
 	}
 
 	var out []string
@@ -190,6 +222,13 @@ func resolveArgs(cfArg string, hasPositional bool, hasUpdate, isBareUpdate bool,
 	return cf, uf, root
 }
 
+func validateChecksumFile(cf string, hasUpdate bool) error {
+	if _, err := os.Stat(cf); os.IsNotExist(err) && !hasUpdate {
+		return fmt.Errorf("checksum file not found: %s (use --update to create it)", cf)
+	}
+	return nil
+}
+
 // ── Main ─────────────────────────────────────────────────────────────
 
 func main() {
@@ -198,6 +237,8 @@ func main() {
 	var optRoot string
 	var verbose bool
 	var summary bool
+	var randomOrder bool
+	var optMaxTime string
 
 	flag.StringVar(&optRoot, "root", "",
 		"directory to scan (default: current directory or dirname of checksum file)")
@@ -221,6 +262,14 @@ func main() {
 		"show scan preamble and summary even when all files are OK")
 	flag.BoolVar(&summary, "s", false,
 		"short for --summary")
+	flag.StringVar(&optMaxTime, "max-time", "",
+		"verify: time budget (e.g. 30m, 1h). Partial run if exceeded")
+	flag.StringVar(&optMaxTime, "m", "",
+		"short for --max-time")
+	flag.BoolVar(&randomOrder, "random-order", false,
+		"verify: randomized file order, skip filesystem scan for new files")
+	flag.BoolVar(&randomOrder, "R", false,
+		"short for --random-order")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr,
@@ -236,12 +285,24 @@ func main() {
 				"By default, if nothing is changed or wrong, nothing is printed (exit 0).\n"+
 				"Use --summary or --verbose to see scan details even when all is OK.\n\n"+
 				"Options:\n"+
+				"  -m, --max-time DUR  Time budget for verify (e.g. 30m, 1h, 45s)\n"+
 				"  -p, --parallel [N]  Parallel hashing (bare = NumCPU, default: sequential)\n"+
+				"  -R, --random-order  Randomized file order, skip filesystem scan\n"+
 				"  -r, --root DIR      Directory to scan (default: current directory)\n"+
 				"  -s, --summary       Show scan preamble and summary\n"+
 				"  -u, --update FILE   Write updated checksums to this file\n"+
 				"  -v, --verbose       Show per-file verification status\n"+
-				"  -h, --help          Show this help\n",
+				"  -h, --help          Show this help\n\n"+
+				"Exit codes (bitwise flags):\n"+
+				"   0  OK — no issues\n"+
+				"   1  Problems detected: Bit rot and/or file access errors\n"+
+				"  15  Usage error\n"+
+				"  16  Partial run (--max-time exceeded), no problems\n"+
+				"  17  Partial run (--max-time exceeded), problems detected\n"+
+				"  32  Random-order run (filesystem scan skipped), no problems\n"+
+				"  33  Random-order run (filesystem scan skipped), problems detected\n"+
+				"  48  Partial + random-order run, no problems\n"+
+				"  49  Partial + random-order run, problems detected\n",
 			os.Args[0])
 	}
 	flag.Parse()
@@ -269,6 +330,21 @@ func main() {
 		die("%v", err)
 	}
 
+	if randomOrder && hasUpdate {
+		die("--random-order and --update/-u are mutually exclusive")
+	}
+
+	var maxTime time.Duration
+	if optMaxTime != "" {
+		maxTime, err = time.ParseDuration(optMaxTime)
+		if err != nil {
+			die("invalid --max-time value: %v", err)
+		}
+		if maxTime <= 0 {
+			die("--max-time must be positive")
+		}
+	}
+
 	if workers.value < 0 {
 		die("--parallel value must be non-negative")
 	}
@@ -278,55 +354,151 @@ func main() {
 		nw = workers.value
 	}
 
-	rot, err := scan(cf, rd, uf, nw, verbose, summary)
-	if err != nil {
-		die("%v", err)
-	}
-	if rot {
-		os.Exit(1)
-	}
-}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-func validateChecksumFile(cf string, hasUpdate bool) error {
-	if _, err := os.Stat(cf); os.IsNotExist(err) && !hasUpdate {
-		return fmt.Errorf("checksum file not found: %s (use --update to create it)", cf)
+	cfg := scanConfig{
+		rootDir:         rd,
+		checksumIn:      cf,
+		checksumOut:     uf,
+		workers:         nw,
+		verbose:         verbose,
+		summary:         summary,
+		randomOrder:     randomOrder,
+		maxTime:         maxTime,
+		totalFilesInOld: -1,
 	}
-		return nil
+
+	bitrot, scanErr := scan(ctx, cfg)
+	var timeErr2 *timeBudgetExceededError
+	if scanErr != nil && !errors.As(scanErr, &timeErr2) {
+		die("%v", scanErr)
+	}
+
+	// Bitwise exit code composition.
+	exitCode := 0
+	if bitrot {
+		exitCode |= exitProblem
+	}
+	var timeErr *timeBudgetExceededError
+	if errors.As(scanErr, &timeErr) {
+		exitCode |= exitPartial
+	}
+	if cfg.randomOrder {
+		exitCode |= exitRandom
+	}
+
+	os.Exit(exitCode)
 }
 
 // ── Core logic ───────────────────────────────────────────────────────
 
-func scan(cf, rootDir, uf string, workers int, verbose, summary bool) (bool, error) {
-	showDetail := verbose || summary
+func scan(ctx context.Context, cfg scanConfig) (bool, error) {
+	showDetail := cfg.verbose || cfg.summary
 
-	old, lastScan, err := loadAndCleanChecksums(cf, rootDir, uf)
+	old, lastScan, err := loadAndCleanChecksums(cfg.checksumIn, cfg.rootDir, cfg.checksumOut)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("reading %s: %w", cfg.checksumIn, err)
 	}
 
 	if showDetail && len(old) > 0 {
 		printPreamble(lastScan, len(old))
 	}
 
-	skip := map[string]bool{cf: true}
-	if uf != "" {
-		skip[uf] = true
-	}
-	cur, err := discover(rootDir, skip)
-	if err != nil {
-		return false, fmt.Errorf("scanning %s: %w", rootDir, err)
+	var cur map[string]fileEntry
+	var deleted []string
+
+	if cfg.randomOrder {
+		cur, deleted = buildFromManifest(old, cfg.rootDir)
+	} else {
+		skip := map[string]bool{cfg.checksumIn: true}
+		if cfg.checksumOut != "" {
+			skip[cfg.checksumOut] = true
+		}
+		cur, err = discover(cfg.rootDir, skip)
+		if err != nil {
+			return false, fmt.Errorf("scanning %s: %w", cfg.rootDir, err)
+		}
+		deleted = findDeleted(old, cur)
 	}
 
-	deleted := findDeleted(old, cur)
-	results := hashAll(cur, workers)
-	r := classifyChanges(old, cur, results, lastScan, verbose, deleted)
+	totalFiles := len(cur) + len(deleted)
 
-	if verbose {
+	applyBudget := cfg.maxTime > 0 && (cfg.randomOrder || cfg.checksumOut == "")
+	tCtx := ctx
+	var tCancel context.CancelFunc = func() {}
+	if applyBudget {
+		tCtx, tCancel = context.WithTimeout(ctx, cfg.maxTime)
+	}
+	defer tCancel()
+
+	var results []hashRes
+	if cfg.randomOrder {
+		if cfg.workers > 0 {
+			results = hashShuffledParallel(tCtx, cur, cfg.workers)
+		} else {
+			results = hashShuffledSequential(tCtx, cur)
+		}
+	} else if applyBudget && cfg.workers > 0 {
+		results = hashParallelTimed(tCtx, cur, cfg.workers)
+	} else if applyBudget {
+		results = hashSequentialTimed(tCtx, cur)
+	} else if cfg.workers > 0 {
+		results = hashParallel(cur, cfg.workers)
+	} else {
+		results = hashSequential(cur)
+	}
+
+	r := classifyChanges(old, cur, results, lastScan, cfg.verbose, deleted)
+
+	if cfg.verbose {
 		printVerboseStatuses(r.statuses)
 	}
-	printSummary(r, len(old) > 0, len(r.newDB), showDetail)
 
-	return r.problem, persistResults(uf, r.newDB, showDetail, r.hasNews())
+	checked := len(results)
+	timedOut := applyBudget && tCtx.Err() != nil && checked < totalFiles
+
+	printSummary(r, len(old) > 0, len(r.newDB), showDetail, timedOut, checked, totalFiles, cfg.maxTime)
+
+	if cfg.randomOrder {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: --random-order set, NOT scanning the filesystem for new files")
+	}
+
+	if cfg.checksumOut != "" {
+		if err := saveMD5(cfg.checksumOut, r.newDB); err != nil {
+			return false, fmt.Errorf("writing %s: %w", cfg.checksumOut, err)
+		}
+		if showDetail || r.hasNews() {
+			fmt.Printf("Wrote %d entries to %s\n", len(r.newDB), cfg.checksumOut)
+		}
+	} else if r.hasNews() {
+		if timedOut {
+			fmt.Fprintf(os.Stderr,
+				"WARNING: run was partial (--max-time exceeded); "+
+					"NOT writing incomplete checksums to a temp file.\n"+
+					"  Checked %d of %d files. Re-run without --max-time for a full pass.\n",
+				checked, totalFiles)
+		} else {
+			tmp, tmpErr := os.CreateTemp("", "bitrot-md5-*.md5")
+			if tmpErr != nil {
+				return false, fmt.Errorf("creating temp file: %w", tmpErr)
+			}
+			if tmpErr := tmp.Close(); tmpErr != nil {
+				return false, tmpErr
+			}
+			if tmpErr := saveMD5(tmp.Name(), r.newDB); tmpErr != nil {
+				return false, fmt.Errorf("writing temp file: %w", tmpErr)
+			}
+			fmt.Printf("Checksums saved to %s\n  Verify and apply: mv %s CHECKSUM_FILE\n",
+				tmp.Name(), tmp.Name())
+		}
+	}
+
+	if timedOut {
+		return r.problem, &timeBudgetExceededError{}
+	}
+	return r.problem, nil
 }
 
 func loadAndCleanChecksums(cf, rootDir, uf string) (map[string]string, time.Time, error) {
@@ -350,6 +522,25 @@ func loadAndCleanChecksums(cf, rootDir, uf string) (map[string]string, time.Time
 	}
 
 	return old, lastScan, nil
+}
+
+func buildFromManifest(old map[string]string, rootDir string) (map[string]fileEntry, []string) {
+	cur := make(map[string]fileEntry, len(old))
+	var deleted []string
+
+	for rel := range old {
+		abs := filepath.Join(rootDir, rel)
+		if info, err := os.Stat(abs); err == nil {
+			cur[rel] = fileEntry{
+				abs:   abs,
+				mtime: info.ModTime(),
+			}
+		} else {
+			deleted = append(deleted, rel)
+		}
+	}
+	sort.Strings(deleted)
+	return cur, deleted
 }
 
 func printPreamble(lastScan time.Time, entryCount int) {
@@ -379,6 +570,14 @@ func classifyChanges(old map[string]string, cur map[string]fileEntry, results []
 
 	for _, res := range results {
 		if res.err != nil {
+			if os.IsNotExist(res.err) {
+				if _, inOld := old[res.rel]; inOld {
+					if verbose {
+						r.statuses[res.rel] = "DELETED"
+					}
+					continue
+				}
+			}
 			r.errs = append(r.errs, ferr{res.rel, res.err.Error()})
 			r.problem = true
 			if verbose {
@@ -440,7 +639,7 @@ func printVerboseStatuses(statuses map[string]string) {
 	fmt.Println()
 }
 
-func printSummary(r scanResult, hasOld bool, newDBCount int, showDetail bool) {
+func printSummary(r scanResult, hasOld bool, newDBCount int, showDetail bool, timedOut bool, checked, totalFiles int, maxTime time.Duration) {
 	show := func(label string, items []change) {
 		fmt.Printf("%s (%d):\n", label, len(items))
 		for _, c := range items {
@@ -459,55 +658,34 @@ func printSummary(r scanResult, hasOld bool, newDBCount int, showDetail bool) {
 		show("MODIFIED", r.modified)
 	}
 	if len(r.deleted) > 0 {
-		fmt.Printf("\nDELETED (%d):\n", len(r.deleted))
+		fmt.Printf("DELETED (%d):\n", len(r.deleted))
 		for _, p := range r.deleted {
 			fmt.Printf("  %s\n", p)
 		}
 	}
 	if len(r.added) > 0 {
-		fmt.Printf("\nNEW (%d):\n", len(r.added))
+		fmt.Printf("NEW (%d):\n", len(r.added))
 		for _, c := range r.added {
 			fmt.Printf("  %s\n", c.path)
 		}
 	}
 	if len(r.errs) > 0 {
-		fmt.Printf("\nERRORS (%d):\n", len(r.errs))
+		fmt.Printf("ERRORS (%d):\n", len(r.errs))
 		for _, e := range r.errs {
 			fmt.Printf("  %s: %s\n", e.p, e.m)
 		}
 	}
 
-	if !r.hasNews() && showDetail {
+	if timedOut {
+		fmt.Printf("PARTIAL: checked %d of %d files (--max-time '%s' exceeded)\n",
+			checked, totalFiles, maxTime)
+	} else if !r.hasNews() && showDetail {
 		if hasOld {
-			fmt.Println("\nAll files OK — no bit rot detected.")
+			fmt.Println("All files OK — no bit rot detected.")
 		} else {
-			fmt.Printf("\nFirst run — indexed %d files.\n", newDBCount)
+			fmt.Printf("First run — indexed %d files.\n", newDBCount)
 		}
 	}
-}
-
-func persistResults(uf string, newDB map[string]string, showDetail, hasNews bool) error {
-	if uf != "" {
-		if err := saveMD5(uf, newDB); err != nil {
-			return fmt.Errorf("writing %s: %w", uf, err)
-		}
-		if showDetail || hasNews {
-			fmt.Printf("\nWrote %d entries to %s\n", len(newDB), uf)
-		}
-	} else if hasNews {
-		tmp, err := os.CreateTemp("", "bitrot-md5-*.md5")
-		if err != nil {
-			return fmt.Errorf("creating temp file: %w", err)
-		}
-		if err := tmp.Close(); err != nil {
-			return err
-		}
-		if err := saveMD5(tmp.Name(), newDB); err != nil {
-			return fmt.Errorf("writing temp file: %w", err)
-		}
-		fmt.Printf("\nChecksums saved to %s\n  Verify and apply: mv %s CHECKSUM_FILE\n", tmp.Name(), tmp.Name())
-	}
-	return nil
 }
 
 // ── md5sum file I/O ──────────────────────────────────────────────────
@@ -545,13 +723,25 @@ func parseLine(line string) (hash, fpath string, ok bool) {
 	if line == "" {
 		return "", "", false
 	}
+	escaped := false
+	if strings.HasPrefix(line, "\\") {
+		escaped = true
+		line = line[1:]
+	}
+
+	var p string
 	if i := strings.Index(line, "  "); i > 0 {
-		return line[:i], strings.TrimPrefix(line[i+2:], "*"), true
+		hash, p = line[:i], strings.TrimPrefix(line[i+2:], "*")
+	} else if i := strings.Index(line, " "); i > 0 {
+		hash, p = line[:i], strings.TrimPrefix(line[i+1:], "*")
+	} else {
+		return "", "", false
 	}
-	if i := strings.Index(line, " "); i > 0 {
-		return line[:i], strings.TrimPrefix(line[i+1:], "*"), true
+	if escaped {
+		p = strings.ReplaceAll(p, "\\n", "\n")
+		p = strings.ReplaceAll(p, "\\\\", "\\")
 	}
-	return "", "", false
+	return hash, p, true
 }
 
 func saveMD5(path string, db map[string]string) error {
@@ -641,7 +831,7 @@ func hashSequential(files map[string]fileEntry) []hashRes {
 func hashParallel(files map[string]fileEntry, nw int) []hashRes {
 	type job struct{ rel, abs string }
 	jobs := make(chan job, nw)
-	out := make(chan hashRes, len(files))
+	out := make(chan hashRes, nw)
 
 	var wg sync.WaitGroup
 	for i := 0; i < nw; i++ {
@@ -678,6 +868,164 @@ func hashParallel(files map[string]fileEntry, nw int) []hashRes {
 	return all
 }
 
+func shuffle(files []hashReq) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := len(files) - 1; i > 0; i-- {
+		j := r.Intn(i + 1)
+		files[i], files[j] = files[j], files[i]
+	}
+}
+
+func hashShuffledSequential(ctx context.Context, files map[string]fileEntry) []hashRes {
+	reqs := make([]hashReq, 0, len(files))
+	for rel, e := range files {
+		reqs = append(reqs, hashReq{rel, e.abs})
+	}
+	shuffle(reqs)
+
+	buf := make([]byte, bufSize)
+	all := make([]hashRes, 0, len(reqs))
+	for _, req := range reqs {
+		if ctx.Err() != nil {
+			break
+		}
+		h, err := md5File(req.abs, buf)
+		all = append(all, hashRes{req.rel, h, err})
+	}
+	return all
+}
+
+func hashShuffledParallel(ctx context.Context, files map[string]fileEntry, nw int) []hashRes {
+	reqs := make([]hashReq, 0, len(files))
+	for rel, e := range files {
+		reqs = append(reqs, hashReq{rel, e.abs})
+	}
+	shuffle(reqs)
+
+	type job struct{ rel, abs string }
+	jobs := make(chan job, nw)
+	out := make(chan hashRes, nw)
+
+	var wg sync.WaitGroup
+	for i := 0; i < nw; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, bufSize)
+			for j := range jobs {
+				h, err := md5File(j.abs, buf)
+				out <- hashRes{j.rel, h, err}
+			}
+		}()
+	}
+
+	go func() {
+		for _, req := range reqs {
+			if ctx.Err() != nil {
+				break
+			}
+			jobs <- job(req)
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	all := make([]hashRes, 0, len(files))
+	for r := range out {
+		all = append(all, r)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].rel < all[j].rel
+	})
+	return all
+}
+
+func hashSequentialTimed(ctx context.Context, files map[string]fileEntry) []hashRes {
+	keys := make([]string, 0, len(files))
+	for k := range files {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	buf := make([]byte, bufSize)
+	all := make([]hashRes, 0, len(files))
+	for _, k := range keys {
+		if ctx.Err() != nil {
+			break
+		}
+		h, err := md5File(files[k].abs, buf)
+		all = append(all, hashRes{k, h, err})
+	}
+	return all
+}
+
+func hashParallelTimed(ctx context.Context, files map[string]fileEntry, nw int) []hashRes {
+	type job struct{ rel, abs string }
+
+	reqs := make([]hashReq, 0, len(files))
+	for rel, e := range files {
+		reqs = append(reqs, hashReq{rel, e.abs})
+	}
+
+	jobs := make(chan job, nw)
+	out := make(chan hashRes, nw)
+
+	var wg sync.WaitGroup
+	for i := 0; i < nw; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, bufSize)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case j, ok := <-jobs:
+					if !ok {
+						return
+					}
+					h, err := md5File(j.abs, buf)
+					out <- hashRes{j.rel, h, err}
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, req := range reqs {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- job(req):
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	all := make([]hashRes, 0, len(files))
+	for r := range out {
+		all = append(all, r)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].rel < all[j].rel
+	})
+	return all
+}
+
+type hashReq struct {
+	rel string
+	abs string
+}
+
 func md5File(path string, buf []byte) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -703,5 +1051,5 @@ func mustAbs(p string) string {
 
 func die(f string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "Error: "+f+"\n", a...)
-	os.Exit(1)
+	os.Exit(exitUsage)
 }
