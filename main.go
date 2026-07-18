@@ -198,7 +198,7 @@ func resolveArgs(cfArg string, hasPositional bool, hasUpdate, isBareUpdate bool,
 		} else {
 			cf = cfArg
 		}
-	} else if hasUpdate {
+	} else if hasUpdate && !isBareUpdate {
 		cf = "/dev/null"
 	} else {
 		cf = defaultName
@@ -912,21 +912,30 @@ func hashShuffledParallel(ctx context.Context, files map[string]fileEntry, nw in
 		go func() {
 			defer wg.Done()
 			buf := make([]byte, bufSize)
-			for j := range jobs {
-				h, err := md5File(j.abs, buf)
-				out <- hashRes{j.rel, h, err}
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case j, ok := <-jobs:
+					if !ok {
+						return
+					}
+					h, err := md5File(j.abs, buf)
+					out <- hashRes{j.rel, h, err}
+				}
 			}
 		}()
 	}
 
 	go func() {
+		defer close(jobs)
 		for _, req := range reqs {
-			if ctx.Err() != nil {
-				break
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- job(req):
 			}
-			jobs <- job(req)
 		}
-		close(jobs)
 	}()
 
 	go func() {

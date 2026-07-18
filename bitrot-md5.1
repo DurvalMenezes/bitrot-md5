@@ -4,7 +4,7 @@ bitrot-md5 \- detect bit rot using md5sum\-compatible checksum files
 .SH SYNOPSIS
 .B bitrot-md5
 .RB [ \-m\ \fIduration\fR ]
-.RB [ \-p\ [ N ]]
+.RB [ \-p\ [ =N ]]
 .RB [ \-R ]
 .RB [ \-r
 .IR DIR ]
@@ -58,13 +58,25 @@ reported as partial.
 This option applies only to verify mode and is ignored by
 .BR \-u / \-\-update .
 .TP
-.BR \-p " \fR[\fP" N "\fR]\fP, " \-\-parallel " \fR[\fP" N "\fR]\fP"
+.BR \-p " \fR[\fP" =N "\fR]\fP, " \-\-parallel " \fR[\fP" =N "\fR]\fP"
 Enable parallel hashing with
 .I N
 worker goroutines.
+An explicit
+.I N
+must be joined with
+.BR = ,
+e.g.
+.B \-p=4
+or
+.BR \-\-parallel=4 .
+.B \-p4
+is not valid flag syntax, and
+.B "\-p 4"
+(space\-separated) will not set the worker count either.
 If
 .I N
-is omitted, defaults to the number of available CPUs.
+is omitted entirely, defaults to the number of available CPUs.
 Default: sequential (single thread).
 Recommended for SSDs, NVMe drives, and network mounts.
 Not recommended for spinning disks, where concurrent reads cause seek
@@ -214,7 +226,7 @@ Scan a specific directory with parallel hashing:
 .PP
 .RS 4
 .nf
-$ bitrot-md5 -p4 -u /mnt/backup/backup.md5 /mnt/backup
+$ bitrot-md5 -p=4 -u /mnt/backup/backup.md5 /mnt/backup
 .fi
 .RE
 .PP

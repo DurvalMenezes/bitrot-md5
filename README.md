@@ -69,7 +69,7 @@ When run with no arguments from `/path/to/mydata/`:
 | Short | Long | Description |
 |---|---|---|
 | `-m DUR` | `--max-time DUR` | Time budget for verify (e.g. `30m`, `1h`, `45s`). Partial run if exceeded. |
-| `-p [N]` | `--parallel [N]` | Parallel hashing with N workers. Bare `--parallel` uses all CPUs. Default: sequential. |
+| `-p[=N]` | `--parallel[=N]` | Parallel hashing with N workers (`=` required for an explicit count, e.g. `-p=4`). Bare `--parallel` uses all CPUs. Default: sequential. |
 | `-R` | `--random-order` | Randomized file order. Skips filesystem scan for new files. |
 | `-r DIR` | `--root DIR` | Directory to scan. Default: current directory, or `dirname` of checksum file if specified. |
 | `-s` | `--summary` | Show scan preamble (last scan time, entry count) and summary even when all is OK. |
@@ -86,8 +86,15 @@ By default, files are hashed sequentially — safe for spinning disks where conc
 For SSDs, NVMe drives, or network mounts, enable parallel hashing:
 
     bitrot-md5 -p -u        # auto-detect CPU count
-    bitrot-md5 -p4 -u       # 4 workers
+    bitrot-md5 -p=4 -u      # 4 workers
     bitrot-md5 --parallel=8 -u
+
+Note the `=` is required for an explicit worker count: `-p4` (no separator)
+is not valid flag syntax, and `-p 4` (space-separated) will not do what you
+expect either — `4` will be silently treated as a leftover positional
+argument rather than the worker count, since bare `-p` (like bare
+`--update`) must remain usable immediately before another flag or a
+positional checksum-file argument.
 
 ### Time-budgeted verification with `--max-time`
 

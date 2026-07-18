@@ -1694,6 +1694,22 @@ func TestResolveArgs_UpdateNoPositional(t *testing.T) {
 	}
 }
 
+func TestResolveArgs_BareUpdateNoPositional(t *testing.T) {
+	defaultName := "/cwd/mydata.md5"
+
+	cf, uf, root := resolveArgs("", false, true, true, "", "", defaultName)
+
+	if cf != defaultName {
+		t.Errorf("cf = %s, want %s (bare -u with no positional should use the default name, not /dev/null)", cf, defaultName)
+	}
+	if uf != defaultName {
+		t.Errorf("uf = %s, want %s (bare -u should read and write the same file)", uf, defaultName)
+	}
+	if root != "." {
+		t.Errorf("root = %q, want %q", root, ".")
+	}
+}
+
 func TestResolveArgs_ExplicitRoot(t *testing.T) {
 	dir := createTempDir(t)
 	file := filepath.Join(dir, "snap.md5")
@@ -1833,6 +1849,46 @@ func TestScanMaxTime_PartialRun(t *testing.T) {
 
 	if strings.Contains(out, "Checksums saved to") {
 		t.Error("partial run should NOT suggest saving an incomplete manifest")
+	}
+}
+
+func TestScanMaxTime_RandomOrderParallel_PartialRun(t *testing.T) {
+	dir := createTempDir(t)
+	cf := filepath.Join(dir, "c.md5")
+	seedLargeChecksums(t, dir, cf, 1000)
+
+	cfg := scanConfig{
+		rootDir:     dir,
+		checksumIn:  cf,
+		checksumOut: "",
+		workers:     4,
+		randomOrder: true,
+		maxTime:     1 * time.Millisecond,
+	}
+
+	start := time.Now()
+	bitrot, out, scanErr := runScanFull(t, cfg)
+	elapsed := time.Since(start)
+
+	if bitrot {
+		t.Error("should not detect bitrot in partial run")
+	}
+
+	var timeErr *timeBudgetExceededError
+	if !errors.As(scanErr, &timeErr) {
+		t.Error("expected timeBudgetExceededError for timed run")
+	}
+
+	if strings.Contains(out, "Checksums saved to") {
+		t.Error("partial run should NOT suggest saving an incomplete manifest")
+	}
+
+	// Workers must stop consuming already-queued jobs promptly once the
+	// deadline fires, not drain whatever happens to be buffered. A large
+	// margin above the 1ms budget still catches a worker pool that
+	// ignores ctx and runs unbounded.
+	if elapsed > 5*time.Second {
+		t.Errorf("random-order parallel run took %s after a 1ms budget; workers may not be honoring ctx cancellation", elapsed)
 	}
 }
 
