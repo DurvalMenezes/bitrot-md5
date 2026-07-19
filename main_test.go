@@ -137,7 +137,7 @@ func TestNormalizeArgs(t *testing.T) {
 		want  []string
 	}{
 		{"double dash to single", []string{"prog", "--verbose", "--update", "file.md5"}, []string{"prog", "-verbose", "-update=file.md5"}},
-		{"single dash preserved", []string{"prog", "-v", "-u", "file.md5"}, []string{"prog", "-v", "-u=file.md5"}},
+	{"single dash preserved", []string{"prog", "-v", "-u=file.md5"}, []string{"prog", "-v", "-u=file.md5"}},
 		{"equals syntax preserved", []string{"prog", "--update=file.md5", "-v"}, []string{"prog", "-update=file.md5", "-v"}},
 		{"positional moved to end", []string{"prog", "checksum.md5", "-v"}, []string{"prog", "-v", "checksum.md5"}},
 		{"interleaved flags and positionals", []string{"prog", "-v", "checksum.md5", "-s"}, []string{"prog", "-v", "-s", "checksum.md5"}},
@@ -148,11 +148,14 @@ func TestNormalizeArgs(t *testing.T) {
 		{"parallel with equals", []string{"prog", "--parallel=4", "checksum.md5"}, []string{"prog", "-parallel=4", "checksum.md5"}},
 		{"multiple positionals moved", []string{"prog", "a.md5", "b.md5", "-v"}, []string{"prog", "-v", "a.md5", "b.md5"}},
 		{"root flag consumes value", []string{"prog", "-r", "/tmp", "-v", "input.md5"}, []string{"prog", "-r=/tmp", "-v", "input.md5"}},
+		{"value paired when flags follow", []string{"prog", "-u", "data/out.md5", "-r", "data"}, []string{"prog", "-u=data/out.md5", "-r=data"}},
+		{"dot joined with equals", []string{"prog", "-u", ".", "-v"}, []string{"prog", "-u=.", "-v"}},
+		{"dotdot joined with equals", []string{"prog", "-r", "..", "-v"}, []string{"prog", "-r=..", "-v"}},
 		{"no args", []string{"prog"}, []string{"prog"}},
 		{"only positionals", []string{"prog", "a.md5", "b.md5"}, []string{"prog", "a.md5", "b.md5"}},
 		{"only flags", []string{"prog", "-v", "-s", "-p"}, []string{"prog", "-v", "-s", "-p"}},
 		{"all flags mixed", []string{"prog", "input.md5", "-v", "-u=output.md5", "-s", "-r", "/tmp"}, []string{"prog", "-v", "-u=output.md5", "-s", "-r=/tmp", "input.md5"}},
-		{"max-time consumed as pair", []string{"prog", "-m", "30m", "input.md5"}, []string{"prog", "-m=30m", "input.md5"}},
+	{"max-time consumed as pair", []string{"prog", "-m=30m", "input.md5"}, []string{"prog", "-m=30m", "input.md5"}},
 		{"max-time with equals", []string{"prog", "-m=1h", "input.md5"}, []string{"prog", "-m=1h", "input.md5"}},
 		{"random-order flag", []string{"prog", "-R", "input.md5"}, []string{"prog", "-R", "input.md5"}},
 	}
@@ -1728,6 +1731,29 @@ func TestResolveArgs_ExplicitRoot(t *testing.T) {
 }
 
 // ── validateChecksumFile ─────────────────────────────────────────────
+
+func TestResolveArgs_UpdateDirReResolution(t *testing.T) {
+	dir := createTempDir(t)
+	subdir := filepath.Join(dir, "data")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulates: -u /path/to/data  where data is a directory
+	// After the directory guard, this should resolve like bare -u + positional
+	cf, uf, root := resolveArgs(subdir, true, true, true, "", "", "dummy")
+
+	expected := filepath.Join(subdir, "data.md5")
+	if cf != expected {
+		t.Errorf("cf = %s, want %s", cf, expected)
+	}
+	if uf != expected {
+		t.Errorf("uf = %s, want %s", uf, expected)
+	}
+	if root != subdir {
+		t.Errorf("root = %s, want %s", root, subdir)
+	}
+}
 
 func TestValidateChecksumFile_MissingNoUpdate(t *testing.T) {
 	err := validateChecksumFile("/nonexistent/file.md5", false)

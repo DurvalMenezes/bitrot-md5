@@ -172,7 +172,7 @@ func normalizeArgs() {
 		}
 
 		if requiresValue[name] && !strings.Contains(arg, "=") &&
-			i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			i+1 < len(args) && args[i+1] != "--" && !strings.HasPrefix(args[i+1], "-") {
 			flags = append(flags, normalized+"="+args[i+1])
 			i += 2
 			continue
@@ -320,6 +320,15 @@ func main() {
 		mustAbs(flag.Arg(0)), flag.NArg() == 1,
 		hasUpdate, isBareUpdate, optUpdate.value, optRoot, defaultName,
 	)
+
+	// If --update value is a directory, re-resolve as bare update + positional.
+	// This handles: bitrot-md5 -u=.  or  bitrot-md5 --update /some/dir
+	if hasUpdate && !isBareUpdate && optUpdate.value != "" {
+		absVal := mustAbs(optUpdate.value)
+		if info, err := os.Stat(absVal); err == nil && info.IsDir() {
+			cf, uf, rootDir = resolveArgs(absVal, true, true, true, "", optRoot, defaultName)
+		}
+	}
 	cf = mustAbs(cf)
 	if uf != "" {
 		uf = mustAbs(uf)
